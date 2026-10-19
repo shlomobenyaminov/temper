@@ -149,6 +149,7 @@ pub async fn run(
     bootstrap::recover_secrets(&state).await;
 
     // Seed secrets from env into the vault for all tenants.
+    let mut sandbox_child: Option<std::process::Child> = None;
     if let Some(ref vault) = state.server.secrets_vault {
         // ANTHROPIC_API_KEY — makes {secret:anthropic_api_key} resolve in LLM integrations.
         cache_platform_secret_if_present(
@@ -188,7 +189,37 @@ pub async fn run(
                 // Find the local sandbox script relative to the binary or os-apps.
                 let sandbox_script =
                     std::path::Path::new("os-apps/temper-agent/sandbox/local_sandbox.py");
-                if sandbox_script.exists() {
+                if !sandbox_script.exists() {
+                    eprintln!(
+                        "  Warning: local sandbox script not found at {sandbox_script:?}\n  Set SANDBOX_URL env var or ensure os-apps/temper-agent/sandbox/local_sandbox.py exists"
+                    );
+                } else if std::net::TcpStream::connect_timeout(
+                    &SocketAddr::from((Ipv4Addr::LOCALHOST, sandbox_port)),
+                    std::time::Duration::from_millis(250),
+                )
+                .is_ok()
+                {
+                    // Something already accepts on the port the sandbox URL
+                    // routes to — most likely a sandbox from a previous run,
+                    // possibly listening on all interfaces. Spawning over it
+                    // would die (or shadow it) silently and requests would
+                    // reach the old listener, so never claim it as ours.
+                    // A connect probe, unlike a bind probe, sees a wildcard
+                    // listener on every platform (SO_REUSEADDR lets a specific
+                    // bind succeed over a wildcard one on macOS).
+                    if bind != Ipv4Addr::UNSPECIFIED {
+                        anyhow::bail!(
+                            "sandbox port {sandbox_port} is already in use; a sandbox from a \
+                             previous run may still be listening on all interfaces, which \
+                             --bind {bind} is meant to prevent. Stop it \
+                             (lsof -ti :{sandbox_port} | xargs kill) or set SANDBOX_URL"
+                        );
+                    }
+                    eprintln!(
+                        "  Warning: sandbox port {sandbox_port} is already in use; requests to {sandbox_url} will reach the existing listener. Stop it or set SANDBOX_URL."
+                    );
+                } else {
+                    // Nothing accepts on the port right now.
                     // Use /tmp/temper-sandbox as the base; create /workspace for tool_runner
                     // which sends cwd="/workspace" by default (matching E2B's layout).
                     let _ = std::fs::create_dir_all("/tmp/temper-sandbox");
@@ -210,21 +241,27 @@ pub async fn run(
                         sandbox_cmd.arg("--host").arg(bind.to_string());
                     }
                     match sandbox_cmd.spawn() {
-                        Ok(_child) => {
-                            println!("  Local sandbox: {sandbox_url} (auto-started)");
+                        Ok(mut child) => {
+                            // A failed bind kills python within milliseconds; catch
+                            // that instead of reporting a sandbox that is not there.
+                            // determinism-ok: startup-only wait in CLI code
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            match child.try_wait() {
+                                Ok(Some(status)) => eprintln!(
+                                    "  Warning: local sandbox exited at startup ({status})\n  Run manually: python3 {sandbox_script:?} --port {sandbox_port}"
+                                ),
+                                _ => {
+                                    println!("  Local sandbox: {sandbox_url} (auto-started)");
+                                    sandbox_child = Some(child);
+                                }
+                            }
                         }
                         Err(e) => {
-                            eprintln!("  Warning: failed to start local sandbox: {e}");
                             eprintln!(
-                                "  Run manually: python3 {sandbox_script:?} --port {sandbox_port}"
+                                "  Warning: failed to start local sandbox: {e}\n  Run manually: python3 {sandbox_script:?} --port {sandbox_port}"
                             );
                         }
                     }
-                } else {
-                    eprintln!("  Warning: local sandbox script not found at {sandbox_script:?}");
-                    eprintln!(
-                        "  Set SANDBOX_URL env var or ensure os-apps/temper-agent/sandbox/local_sandbox.py exists"
-                    );
                 }
 
                 sandbox_url
@@ -337,9 +374,13 @@ pub async fn run(
     }
 
     println!("Listening on http://{bind}:{actual_port}");
-    axum::serve(listener, router)
-        .await
-        .context("Server error")?;
+    let served = axum::serve(listener, router).await;
+    if let Some(mut child) = sandbox_child {
+        // The auto-started sandbox is this process's child; take it down with
+        // the server instead of leaving a stray listener behind.
+        let _ = child.kill();
+    }
+    served.context("Server error")?;
 
     Ok(())
 }
